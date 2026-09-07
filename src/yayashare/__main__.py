@@ -17,7 +17,8 @@ def main():
     app = QApplication(sys.argv[:1])
     app.setApplicationName("YayaShare")
     app.setOrganizationName("YayaShare")
-    app.setApplicationVersion("1.1.0")
+    from . import __version__
+    app.setApplicationVersion(__version__)
     from PySide6.QtGui import QIcon
     app.setWindowIcon(QIcon(str(Path(__file__).parent / "assets/icon.png")))
     if sys.platform == "win32":
