@@ -38,7 +38,13 @@ jobs:
       - name: Install
         run: python -m pip install -e ".[dev]"
       - name: Test
-        run: python -m pytest -q
+        run: python -m pytest -q --junitxml=build/test-results.xml
+      - name: Save test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Test-results-${{ matrix.artifact }}
+          path: build/test-results.xml
       - name: Package and smoke test
         run: python scripts/build.py
       - uses: actions/upload-artifact@v4
@@ -60,6 +66,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
+          pattern: YayaShare-*
           merge-multiple: true
       - name: Create downloadable release draft
         env:

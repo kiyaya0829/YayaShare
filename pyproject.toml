@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yayashare"
-version = "0.1.0"
+version = "1.1.0"
 description = "Private LAN sharing for macOS and Windows"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,9 @@ yayashare = "yayashare.__main__:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+yayashare = ["assets/*"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

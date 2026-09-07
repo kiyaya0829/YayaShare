@@ -16,6 +16,8 @@ import uuid
 
 from .security import Invitation, certificate, pinned_socket
 from .storage import safe_name
+from .clipboard import ClipboardSync, valid_text
+from .folders import receive_folder, send_folder
 
 PORT = 45873
 MAX_FRAME = 512 * 1024
@@ -85,6 +87,7 @@ class Service:
         self.connections = set()
         self.lock = threading.Lock()
         self.listener = None
+        self.clipboard = ClipboardSync()
 
     @property
     def info(self):
@@ -157,13 +160,26 @@ class Service:
             peer = self.state.peers().get(peer_id)
             if not peer or not secrets.compare_digest(peer["token"], token):
                 raise ValueError("设备未受信任，请重新配对")
+            if op == "capabilities":
+                send_json(conn, {"ok": True, "capabilities": ["folder", "clipboard-text-v1"]})
+                return
             if op == "text":
                 text = request.get("text")
+                if request.get("purpose") == "clipboard":
+                    if request.get("mime") != "text/plain":
+                        raise ValueError("只支持纯文本剪贴板")
+                    self.clipboard.receive(peer_id, request.get("update_id"), text)
+                    send_json(conn, {"ok": True})
+                    return
+                if "purpose" in request:
+                    raise ValueError("未知文本用途")
                 if not isinstance(text, str) or not text or len(text.encode("utf-8")) > MAX_TEXT:
                     raise ValueError("文本为空或超过 64 KiB")
                 self.state.record("text", peer["name"], text)
             elif op == "file":
                 self._receive_file(conn, request, peer)
+            elif op == "folder":
+                receive_folder(self, conn, request, peer)
             else:
                 raise ValueError("未知请求")
             send_json(conn, {"ok": True})
@@ -247,6 +263,8 @@ class Service:
                 response(conn)
             return
         path = Path(path)
+        if path.is_dir():
+            return send_folder(self, peer, path, progress)
         with open(path, "rb") as source:
             import stat
             meta = os.fstat(source.fileno())
@@ -271,7 +289,28 @@ class Service:
                         progress(int(sent * 100 / max(meta.st_size, 1)))
                 response(conn)
 
+    def send_clipboard(self, peer, update, generation):
+        if not valid_text(update.get("text")):
+            raise ValueError("无效剪贴板文本")
+        auth = {"version": 1, "id": self.state.identity["id"], "token": peer["token"]}
+        with pinned_socket(peer["host"], peer["port"], peer["fingerprint"]) as conn:
+            send_json(conn, {**auth, "op": "capabilities"})
+            if "clipboard-text-v1" not in response(conn).get("capabilities", []):
+                raise ValueError("请将对方更新到 YayaShare v1.1")
+        # Re-check trust and switch after connecting, before transmitting text.
+        with pinned_socket(peer["host"], peer["port"], peer["fingerprint"]) as conn:
+            with self.clipboard.lock:
+                current = self.state.peers().get(peer["id"])
+                if (not self.clipboard.enabled or self.clipboard.generation != generation
+                        or not current or current["token"] != peer["token"]):
+                    return
+                send_json(conn, {"version": 1, "op": "text", "purpose": "clipboard",
+                                 "mime": "text/plain", "id": self.state.identity["id"],
+                                 "token": peer["token"], **update})
+            response(conn)
+
     def stop(self):
+        self.clipboard.configure(False)
         self.stop_event.set()
         if self.listener:
             self.listener.close()
