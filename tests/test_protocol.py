@@ -52,7 +52,7 @@ def test_bidirectional_text_and_persistence(pair):
     assert restored.history() == a.state.history()
 
 
-@pytest.mark.parametrize("data", [b"", b"abc\x00" * 200000])
+@pytest.mark.parametrize("data", [b"", b"abc\x00" * 200000], ids=["empty", "binary-800KB"])
 def test_file_stream_and_duplicate_names(pair, tmp_path, data):
     a, b, peer = pair
     source = tmp_path / "中文 example.bin"
