@@ -4,11 +4,11 @@ import ipaddress
 import time
 
 from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QSplitter, QVBoxLayout, QWidget)
+    QPushButton, QSplitter, QVBoxLayout, QWidget, QCheckBox)
 
 from .discovery import Discovery
 from .protocol import PORT, Service
@@ -47,9 +47,13 @@ class Window(QMainWindow):
         if discover:
             self.discovery.start()
         self.job = None
+        self.clipboard_job = None
+        self.clipboard_pending = None
+        self.applying_clipboard = False
         self.last_history = None
         self.last_devices = None
         self.setWindowTitle("YayaShare · 局域网共享")
+        self.setWindowIcon(QIcon(str(Path(__file__).parent / "assets/icon.png")))
         self.resize(940, 680)
         self.setMinimumSize(740, 560)
         root = QWidget()
@@ -77,13 +81,20 @@ class Window(QMainWindow):
         self.forget_btn.clicked.connect(self.forget)
         row.addWidget(self.forget_btn)
         layout.addLayout(row)
+        self.sync_toggle = QCheckBox("Clipboard Sync · 自动同步纯文本到所有已配对设备")
+        self.sync_toggle.setToolTip("默认关闭，每次启动需重新开启。两边均需开启；仅同步开启后新复制的纯文本。")
+        self.sync_toggle.toggled.connect(self.configure_clipboard)
+        layout.addWidget(self.sync_toggle)
+        self.sync_status = QLabel("剪贴板同步已关闭")
+        self.sync_status.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.sync_status)
         split = QSplitter()
         compose = QWidget()
         left = QVBoxLayout(compose)
         left.setContentsMargins(0, 0, 8, 0)
         left.addWidget(QLabel("发送文字"))
         self.editor = QPlainTextEdit()
-        self.editor.setPlaceholderText("输入文字，或读取剪贴板后发送…\n\n只会在你点击发送时共享。")
+        self.editor.setPlaceholderText("这里的文字在点击发送时共享。\n自动剪贴板同步由上方开关控制。")
         left.addWidget(self.editor)
         actions = QHBoxLayout()
         self.clip_btn = QPushButton("读取剪贴板")
@@ -97,6 +108,9 @@ class Window(QMainWindow):
         self.file_btn = QPushButton("选择文件并发送 · 最大 2 GiB")
         self.file_btn.clicked.connect(self.send_file)
         left.addWidget(self.file_btn)
+        self.folder_btn = QPushButton("选择文件夹并发送 · 总计最大 2 GiB")
+        self.folder_btn.clicked.connect(self.send_folder)
+        left.addWidget(self.folder_btn)
         split.addWidget(compose)
         history_panel = QWidget()
         right = QVBoxLayout(history_panel)
@@ -143,7 +157,75 @@ class Window(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(1000)
+        self.clipboard_timer = QTimer(self)
+        self.clipboard_timer.timeout.connect(self.poll_clipboard)
+        self.clipboard_timer.start(400)
+        QApplication.clipboard().dataChanged.connect(self.poll_clipboard)
         self.refresh()
+
+    def clipboard_text(self):
+        mime = QApplication.clipboard().mimeData()
+        if mime is None or not mime.hasText() or mime.hasUrls() or mime.hasImage():
+            return None
+        return mime.text()
+
+    def configure_clipboard(self, enabled):
+        self.service.clipboard.configure(enabled, self.clipboard_text())
+        self.clipboard_pending = None
+        self.sync_status.setText("已开启：新复制的纯文本将同步到所有已配对设备（两边均需开启）" if enabled else "剪贴板同步已关闭")
+
+    def poll_clipboard(self):
+        if self.applying_clipboard or not self.service.clipboard.enabled:
+            return
+        sync = self.service.clipboard
+        self.applying_clipboard = True
+        try:
+            if sync.apply_pending(self.state.peers(), QApplication.clipboard().setText):
+                # OS clipboard may normalize line endings. Baseline the read-back
+                # so the resulting dataChanged/poll never turns into a new update.
+                sync.last_text = self.clipboard_text()
+                self.clipboard_pending = None
+                self.sync_status.setText("已接收远端剪贴板，可以直接粘贴")
+            update = sync.local_change(self.clipboard_text())
+            if update:
+                self.clipboard_pending = (update, sync.generation)
+        finally:
+            self.applying_clipboard = False
+        if self.clipboard_job or not self.clipboard_pending:
+            return
+        update, generation = self.clipboard_pending
+        self.clipboard_pending = None
+        peers = self.state.peers()
+        found = self.discovery.snapshot()
+        for pid, peer in peers.items():
+            if pid in found:
+                peer.update(host=found[pid]["host"], port=found[pid]["port"])
+        if not peers:
+            self.sync_status.setText("剪贴板同步等待配对设备")
+            return
+        def send(_):
+            errors = []
+            for peer in peers.values():
+                if not sync.enabled or sync.generation != generation:
+                    break
+                try:
+                    self.service.send_clipboard(peer, update, generation)
+                except Exception as exc:
+                    errors.append(f"{peer['name']}: {exc}")
+            if errors:
+                raise ValueError("；".join(errors))
+        self.clipboard_job = Job(send, self)
+        self.clipboard_job.result.connect(self.clipboard_result)
+        self.clipboard_job.finished.connect(self.clipboard_finished)
+        self.clipboard_job.start()
+
+    def clipboard_result(self, error):
+        if self.sync_toggle.isChecked():
+            self.sync_status.setText("同步未完成：" + error if error else "新剪贴板已发送")
+
+    def clipboard_finished(self):
+        self.clipboard_job.deleteLater()
+        self.clipboard_job = None
 
     def refresh(self):
         known = self.state.peers()
@@ -175,8 +257,9 @@ class Window(QMainWindow):
             self.last_history = history
             self.history_list.clear()
             for entry in history:
-                content = Path(entry["content"]).name if entry["kind"] == "file" else entry["content"]
-                label = f"{'文件' if entry['kind'] == 'file' else '文字'} · {entry['sender']}\n{content[:70].replace(chr(10), ' ')}"
+                content = Path(entry["content"]).name if entry["kind"] in ("file", "folder") else entry["content"]
+                kind = {"file": "文件", "folder": "文件夹", "text": "文字"}.get(entry["kind"], entry["kind"])
+                label = f"{kind} · {entry['sender']}\n{content[:70].replace(chr(10), ' ')}"
                 item = QListWidgetItem(label)
                 item.setToolTip(entry["time"])
                 self.history_list.addItem(item)
@@ -201,7 +284,7 @@ class Window(QMainWindow):
         self.status.setText(message)
         self.progress.setValue(0)
         self.progress.show()
-        for button in (self.pair_btn, self.send_btn, self.file_btn, self.forget_btn):
+        for button in (self.pair_btn, self.send_btn, self.file_btn, self.folder_btn, self.forget_btn):
             button.setEnabled(False)
         self.job = Job(fn, self)
         self.job.progress.connect(self.progress.setValue)
@@ -219,7 +302,7 @@ class Window(QMainWindow):
         self.job.deleteLater()
         self.job = None
         self.progress.hide()
-        for button in (self.pair_btn, self.send_btn, self.file_btn, self.forget_btn):
+        for button in (self.pair_btn, self.send_btn, self.file_btn, self.folder_btn, self.forget_btn):
             button.setEnabled(True)
         self.refresh()
 
@@ -243,6 +326,13 @@ class Window(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "选择要发送的文件")
         if path:
             self.run_job(lambda progress: self.service.send(peer, path=path, progress=progress), "正在校验并发送文件…")
+
+    def send_folder(self):
+        peer = self.trusted()
+        if peer:
+            path = QFileDialog.getExistingDirectory(self, "选择要发送的整个文件夹")
+            if path:
+                self.run_job(lambda progress: self.service.send(peer, path=path, progress=progress), "正在校验并发送文件夹…")
 
     def show_invitation(self):
         from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
@@ -318,11 +408,14 @@ class Window(QMainWindow):
             self.status.setText("已取消信任，对方不能再发送内容。重新连接需重新配对。")
 
     def closeEvent(self, event):
-        if self.job and self.job.isRunning():
+        if self.job or self.clipboard_job:
+            self.sync_toggle.setChecked(False)
             self.status.setText("正在传输，请等待完成后关闭窗口。")
             event.ignore()
             return
         self.timer.stop()
+        self.clipboard_timer.stop()
+        QApplication.clipboard().dataChanged.disconnect(self.poll_clipboard)
         self.discovery.stop()
         self.service.stop()
         event.accept()

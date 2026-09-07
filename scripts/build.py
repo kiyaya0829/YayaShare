@@ -8,6 +8,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -15,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     os.chdir(ROOT)
     mac = sys.platform == "darwin"
+    version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
     if sys.platform not in ("darwin", "win32"):
         raise SystemExit("Build on macOS arm64 or Windows x64")
     expected = "arm64" if mac else "AMD64"
@@ -39,7 +41,21 @@ def main():
             break
     command = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed", "--onedir",
                "--name", "YayaShare", "--paths", "src", "--add-data", f"{licenses}{os.pathsep}licenses",
-               "--add-data", f"THIRD_PARTY_NOTICES.md{os.pathsep}."]
+               "--add-data", f"THIRD_PARTY_NOTICES.md{os.pathsep}.",
+               "--add-data", f"src/yayashare/assets{os.pathsep}yayashare/assets",
+               "--icon", "src/yayashare/assets/icon.icns" if mac else "src/yayashare/assets/icon.ico"]
+    if not mac:
+        from PyInstaller.utils.win32.versioninfo import (VSVersionInfo, FixedFileInfo,
+            StringFileInfo, StringTable, StringStruct, VarFileInfo, VarStruct)
+        numbers = tuple(int(n) for n in version.split(".")) + (0,)
+        info = VSVersionInfo(ffi=FixedFileInfo(filevers=numbers, prodvers=numbers), kids=[
+            StringFileInfo([StringTable("040904B0", [StringStruct(k, v) for k, v in {
+                "FileDescription": "YayaShare", "ProductName": "YayaShare", "FileVersion": version,
+                "ProductVersion": version, "OriginalFilename": "YayaShare.exe"}.items()])]),
+            VarFileInfo([VarStruct("Translation", [1033, 1200])])])
+        version_file = ROOT / "build/version.txt"
+        version_file.write_text(str(info), encoding="utf-8")
+        command += ["--version-file", str(version_file)]
     if mac:
         command += ["--target-architecture", "arm64", "--osx-bundle-identifier", "io.github.kiyaya0829.yayashare"]
     command += ["scripts/launcher.py"]
@@ -48,12 +64,18 @@ def main():
         plist_path = ROOT / "dist/YayaShare.app/Contents/Info.plist"
         with plist_path.open("rb") as source:
             plist = plistlib.load(source)
-        plist.update(CFBundleShortVersionString="0.1.0", CFBundleVersion="0.1.0",
+        plist.update(CFBundleShortVersionString=version, CFBundleVersion=version,
                      NSLocalNetworkUsageDescription="YayaShare 在局域网发现你的电脑，并加密传输你选择的文字和文件。")
         with plist_path.open("wb") as output:
             plistlib.dump(plist, output)
         subprocess.run(["codesign", "--force", "--deep", "--sign", "-", "dist/YayaShare.app"], check=True)
     executable = ROOT / ("dist/YayaShare.app/Contents/MacOS/YayaShare" if mac else "dist/YayaShare/YayaShare.exe")
+    if mac:
+        assert (ROOT / "dist/YayaShare.app/Contents/Resources" / plist["CFBundleIconFile"]).is_file()
+    else:
+        import pefile
+        with pefile.PE(str(executable)) as pe:
+            assert any(e.id == 14 for e in pe.DIRECTORY_ENTRY_RESOURCE.entries), "Missing Windows icon"
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
     subprocess.run([str(executable), "--smoke-test", "--no-discovery", "--port", "0", "--data-dir", str(ROOT / "build/bundle-smoke")],
                    env=env, check=True, timeout=60)
