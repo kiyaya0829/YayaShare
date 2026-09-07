@@ -4,6 +4,7 @@ import importlib.metadata
 import os
 from pathlib import Path
 import platform
+import plistlib
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,15 @@ def main():
         command += ["--target-architecture", "arm64", "--osx-bundle-identifier", "io.github.kiyaya0829.yayashare"]
     command += ["scripts/launcher.py"]
     subprocess.run(command, check=True)
+    if mac:
+        plist_path = ROOT / "dist/YayaShare.app/Contents/Info.plist"
+        with plist_path.open("rb") as source:
+            plist = plistlib.load(source)
+        plist.update(CFBundleShortVersionString="0.1.0", CFBundleVersion="0.1.0",
+                     NSLocalNetworkUsageDescription="YayaShare 在局域网发现你的电脑，并加密传输你选择的文字和文件。")
+        with plist_path.open("wb") as output:
+            plistlib.dump(plist, output)
+        subprocess.run(["codesign", "--force", "--deep", "--sign", "-", "dist/YayaShare.app"], check=True)
     executable = ROOT / ("dist/YayaShare.app/Contents/MacOS/YayaShare" if mac else "dist/YayaShare/YayaShare.exe")
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
     subprocess.run([str(executable), "--smoke-test", "--no-discovery", "--port", "0", "--data-dir", str(ROOT / "build/bundle-smoke")],
@@ -53,7 +63,8 @@ def main():
         subprocess.run(["ditto", "-c", "-k", "--sequesterRsrc", "--keepParent", "dist/YayaShare.app", str(archive)], check=True)
     else:
         shutil.make_archive(str(archive.with_suffix("")), "zip", ROOT / "dist", "YayaShare")
-    digest = hashlib.file_digest(archive.open("rb"), "sha256").hexdigest()
+    with archive.open("rb") as source:
+        digest = hashlib.file_digest(source, "sha256").hexdigest()
     archive.with_suffix(".zip.sha256").write_text(f"{digest}  {archive.name}\n", encoding="ascii")
     print(f"Built and smoke-tested: {archive}")
 

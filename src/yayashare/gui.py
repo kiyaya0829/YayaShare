@@ -245,11 +245,17 @@ class Window(QMainWindow):
             self.run_job(lambda progress: self.service.send(peer, path=path, progress=progress), "正在校验并发送文件…")
 
     def show_invitation(self):
+        from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
+        addresses = [a.toString() for a in QNetworkInterface.allAddresses()
+                     if a.protocol() == QAbstractSocket.NetworkLayerProtocol.IPv4Protocol and not a.isLoopback()]
         code = self.service.invitation.create()
         dialog = QDialog(self)
         dialog.setWindowTitle("我的一次性配对码")
         layout = QVBoxLayout(dialog)
-        label = QLabel("在另一台设备点击「配对」，输入本机 IP 和下面的配对码。\n配对码包含证书指纹，5 分钟内有效，成功使用一次即失效。\n仅通过你信任的渠道传给自己的另一台设备。")
+        label = QLabel("在另一台设备点击「配对」，输入本机 IP 和下面的配对码。\n"
+                       f"本机 IPv4：{', '.join(addresses) or '未找到局域网地址'}   端口：{self.service.port}\n"
+                       "配对码包含证书指纹，5 分钟内有效，成功使用一次即失效。\n仅通过你信任的渠道传给自己的另一台设备。")
+        label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(label)
         field = QLineEdit(code)
         field.setReadOnly(True)

@@ -7,6 +7,21 @@ import time
 DISCOVERY_PORT = 45874
 
 
+def broadcast_addresses():
+    # Qt already ships with the GUI and supplies portable interface/netmask data.
+    # Directed broadcasts also work on networks without a route for 255.255.255.255.
+    from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
+    targets = set()
+    for interface in QNetworkInterface.allInterfaces():
+        flags = interface.flags()
+        if not flags & QNetworkInterface.InterfaceFlag.IsUp or not flags & QNetworkInterface.InterfaceFlag.CanBroadcast:
+            continue
+        for entry in interface.addressEntries():
+            if entry.ip().protocol() == QAbstractSocket.NetworkLayerProtocol.IPv4Protocol and not entry.broadcast().isNull():
+                targets.add(entry.broadcast().toString())
+    return sorted(targets) or ["255.255.255.255"]
+
+
 def parse_advertisement(data, host):
     value = json.loads(data)
     if not isinstance(value, dict) or value.get("app") != "YayaShare" or value.get("version") != 1:
@@ -17,8 +32,9 @@ def parse_advertisement(data, host):
 
 
 class Discovery:
-    def __init__(self, info):
+    def __init__(self, info, port=DISCOVERY_PORT):
         self.info = info
+        self.port = port
         self.lock = threading.Lock()
         self.devices = {}
         self.stopped = threading.Event()
@@ -30,13 +46,14 @@ class Discovery:
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         try:
-            self.sock.bind(("", DISCOVERY_PORT))
+            self.sock.bind(("", self.port))
         except OSError as exc:
             self.error = str(exc)
             self.sock.close()
             self.sock = None
             return
         self.sock.settimeout(0.5)
+        self.port = self.sock.getsockname()[1]
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -45,10 +62,14 @@ class Discovery:
         payload = json.dumps({"app": "YayaShare", "version": 1, **self.info}).encode()
         while not self.stopped.is_set():
             if time.monotonic() - last > 3:
-                try:
-                    self.sock.sendto(payload, ("255.255.255.255", DISCOVERY_PORT))
-                except OSError as exc:
-                    self.error = str(exc)
+                errors = []
+                targets = broadcast_addresses()
+                for target in targets:
+                    try:
+                        self.sock.sendto(payload, (target, self.port))
+                    except OSError as exc:
+                        errors.append(str(exc))
+                self.error = errors[0] if len(errors) == len(targets) else ""
                 last = time.monotonic()
             try:
                 data, addr = self.sock.recvfrom(2048)

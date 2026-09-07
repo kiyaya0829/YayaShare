@@ -7,7 +7,7 @@ import time
 
 import pytest
 
-from yayashare.discovery import parse_advertisement
+from yayashare.discovery import Discovery, parse_advertisement
 from yayashare.protocol import MAX_FILE, MAX_FRAME, MAX_TEXT, Service, read_json, response, send_json
 from yayashare.security import Invitation, pinned_socket
 from yayashare.storage import State, safe_name
@@ -178,3 +178,21 @@ def test_history_bounded(tmp_path):
         state.record("text", "test", str(i))
     assert len(state.history()) == 100
     assert state.history()[0]["content"] == "104"
+
+
+def test_real_udp_discovery(pair):
+    a, b, _ = pair
+    discovery = Discovery(a.info, port=0)
+    discovery.start()
+    try:
+        assert discovery.sock is not None
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.sendto(b"malformed", ("127.0.0.1", discovery.port))
+            packet = json.dumps({"app": "YayaShare", "version": 1, **b.info}).encode()
+            sender.sendto(packet, ("127.0.0.1", discovery.port))
+        deadline = time.monotonic() + 3
+        while b.info["id"] not in discovery.snapshot() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert discovery.snapshot()[b.info["id"]]["host"] == "127.0.0.1"
+    finally:
+        discovery.stop()
