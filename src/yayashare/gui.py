@@ -81,6 +81,9 @@ class Window(QMainWindow):
         self.forget_btn.clicked.connect(self.forget)
         row.addWidget(self.forget_btn)
         layout.addLayout(row)
+        self.web_btn = QPushButton("手机网页 · 扫码收发文字和文件")
+        self.web_btn.clicked.connect(self.show_web_portal)
+        layout.addWidget(self.web_btn)
         self.sync_toggle = QCheckBox("Clipboard Sync · 自动同步纯文本到所有已配对设备")
         self.sync_toggle.setToolTip("默认关闭，每次启动需重新开启。两边均需开启；仅同步开启后新复制的纯文本。")
         self.sync_toggle.toggled.connect(self.configure_clipboard)
@@ -168,6 +171,12 @@ class Window(QMainWindow):
         if mime is None or not mime.hasText() or mime.hasUrls() or mime.hasImage():
             return None
         return mime.text()
+
+    def show_web_portal(self):
+        from .web_dialog import PortalDialog
+        dialog = PortalDialog(self)
+        dialog.exec()
+        dialog.deleteLater()
 
     def configure_clipboard(self, enabled):
         self.service.clipboard.configure(enabled, self.clipboard_text())
