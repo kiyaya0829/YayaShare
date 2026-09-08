@@ -24,7 +24,7 @@ def main():
         raise SystemExit(f"Expected {expected} Python, got {platform.machine()}")
     licenses = ROOT / "build/licenses"
     licenses.mkdir(parents=True, exist_ok=True)
-    for package in ("PySide6", "PySide6_Essentials", "PySide6_Addons", "shiboken6", "cryptography", "cffi", "pycparser", "pyinstaller"):
+    for package in ("PySide6", "PySide6_Essentials", "PySide6_Addons", "shiboken6", "cryptography", "cffi", "pycparser", "pyinstaller", "qrcode"):
         dist = importlib.metadata.distribution(package)
         for entry in dist.files or []:
             if any(word in str(entry).lower() for word in ("license", "copying", "notice")):
@@ -43,6 +43,7 @@ def main():
                "--name", "YayaShare", "--paths", "src", "--add-data", f"{licenses}{os.pathsep}licenses",
                "--add-data", f"THIRD_PARTY_NOTICES.md{os.pathsep}.",
                "--add-data", f"src/yayashare/assets{os.pathsep}yayashare/assets",
+               "--add-data", f"src/yayashare/web{os.pathsep}yayashare/web",
                "--icon", "src/yayashare/assets/icon.icns" if mac else "src/yayashare/assets/icon.ico"]
     if not mac:
         from PyInstaller.utils.win32.versioninfo import (VSVersionInfo, FixedFileInfo,

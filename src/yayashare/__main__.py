@@ -39,6 +39,21 @@ def main():
         return 1
     window.show()
     if args.smoke_test:
+        # Verify that a packaged app includes the phone page and QR dependency.
+        from .web_portal import WebPortal
+        from .web_dialog import qr_image
+        import http.client
+        portal = WebPortal(state, ["127.0.0.1"], host="127.0.0.1", port=0)
+        try:
+            assert not qr_image(portal.url("127.0.0.1")).isNull()
+            for path in ("/", "/app.js", "/style.css"):
+                conn = http.client.HTTPConnection("127.0.0.1", portal.port, timeout=5)
+                conn.request("GET", path)
+                response = conn.getresponse()
+                assert response.status == 200 and response.read()
+                conn.close()
+        finally:
+            portal.stop()
         if app.windowIcon().isNull() or window.windowIcon().isNull():
             window.close()
             return 1

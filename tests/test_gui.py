@@ -59,3 +59,32 @@ def test_automatic_clipboard_ui_gate_mime_and_remote_echo(tmp_path):
     finally:
         window.close()
         app.processEvents()
+
+
+def test_phone_portal_opt_in_share_and_close(tmp_path, monkeypatch):
+    from yayashare import web_dialog
+    from yayashare.web_portal import WebPortal
+    app = QApplication.instance() or QApplication([])
+    window = Window(State(tmp_path), port=0, discover=False)
+    monkeypatch.setattr(web_dialog, 'WebPortal', lambda state, addresses, **kw:
+                        WebPortal(state, addresses, host='127.0.0.1', port=0, **kw))
+    dialog = web_dialog.PortalDialog(window)
+    try:
+        assert dialog.portal is None and not dialog.start.isEnabled()
+        assert not dialog.add_text.isEnabled()
+        dialog.consent.setChecked(True)
+        dialog.start.click()
+        portal = dialog.portal
+        assert portal.active() and dialog.link.text().startswith('http://')
+        assert not dialog.qr.pixmap().isNull()
+        dialog.text.setPlainText('电脑发给手机 🐾')
+        dialog.add_text.click()
+        assert portal.listing()[0]['text'] == '电脑发给手机 🐾'
+        assert not window.state.history()
+        dialog.reject()  # Escape must revoke as well as the window close button.
+        assert not portal.active() and not portal.spool.exists()
+        assert dialog.portal is None
+    finally:
+        dialog.close()
+        window.close()
+        app.processEvents()

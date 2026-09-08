@@ -23,6 +23,27 @@ These builds are not notarized with Apple Developer ID or signed with Windows Au
 
 ## Features
 
+### Phone browser portal (v1.2)
+
+Use an iPhone, iPad, or Android browser without installing an app. The desktop app serves the page locally; no hosted website or cloud account is involved.
+
+1. Upgrade the computer to v1.2 and connect your phone to the same reachable local network.
+2. Click **手机网页 · 扫码收发文字和文件** (Phone browser) in the desktop window. Read and acknowledge the **unencrypted HTTP** notice, then click **开启手机入口** (Open phone portal). It is off by default.
+3. Choose the computer's Wi-Fi IPv4 address if multiple addresses appear. Scan the QR code with the phone camera and open it in Safari or your browser. You can also copy the temporary link. Treat the complete link as a temporary password and do not forward it.
+4. On the phone, enter text and tap **发送文字**, or choose photos/files and tap **发送选中文件**. Wait for the message confirming receipt on the computer. Received items appear in the desktop history and ordinary receive directory.
+5. To send back to the phone, explicitly add text or a file in the desktop portal window. It appears under **从电脑接收** on the phone. Copy the text or download the file. On iPhone, downloads can be found in the browser's download list / Files app; photos are not automatically saved to the Photos library.
+6. Keep the desktop portal window open while using it. Closing it, clicking the revoke button, or reaching 30 minutes invalidates the link and browser session. Reopen and scan a new code to reconnect.
+
+The link authorizes **one browser session** and can be used only once. Refreshing that same browser page retains access through its temporary cookie. Another browser, private browsing session, or another phone needs a new portal. Desktop pairing codes and the phone QR code are separate.
+
+- Phone text: up to 64 KiB. Files: up to **256 MiB each**, sent sequentially when selecting multiple files. Each session allows up to 50 incoming items / 512 MiB and 50 outgoing items / 512 MiB of file snapshots. No folder uploads or resumable transfers yet.
+- The page can only download files/text you explicitly share in this window. Existing history, folders, desktop trust tokens, and other local files are not exposed. Outgoing files are copied into a temporary snapshot; closing the portal removes these copies but preserves originals and received files.
+- Keep both devices awake and the browser in the foreground during transfers. Cancelling interrupts the current upload; files already received remain on the computer. After a network error, check desktop history before retrying to avoid duplicates.
+- Browser clipboard access varies: the Copy button falls back to selecting text for manual copying. Automatic background clipboard sync is available only between desktop apps. The app does not convert photos or guarantee their original format; the browser chooses the uploaded representation.
+- Allow **TCP 45875** on the computer's trusted/private network while the portal is open. Campus/guest Wi-Fi client isolation can block even a correct QR link. Use a trusted router or personal hotspot when necessary; scanning cannot bypass network isolation. Do not forward this port to the internet.
+
+**Security tradeoff:** the phone portal uses HTTP to avoid requiring a self-signed certificate on the phone. Content and session cookies are **not encrypted in transit** and can be observed or modified by an attacker on the network. The temporary token, one-use authorization, exact IP/Host checks, same-origin checks, and disabled cross-origin access limit unauthorized requests; they do not replace TLS. Use only on trusted networks for non-sensitive content. Desktop-to-desktop sharing continues to use pinned TLS.
+
 ### Automatic clipboard sync
 
 Upgrade both computers to v1.1 or later and enable **Clipboard Sync** on each. Copy new text on either computer, then paste it on the other.
@@ -125,6 +146,9 @@ src/yayashare/
   security.py     TLS certificates, fingerprint pinning, pairing codes
   protocol.py     JSON framing, trusted authentication, file streaming
   storage.py      Atomic state persistence, history, safe filenames
+  web_portal.py   Opt-in local HTTP server, temporary authorization, file quotas
+  web_dialog.py   Desktop QR code and explicit phone sharing controls
+  web/           Self-contained mobile HTML, CSS, and JavaScript
   assets/        Application artwork and platform icons
 tests/           Local two-peer TLS integration, invalid-input, and GUI tests
 scripts/         Packaging, icon conversion, and application launcher
@@ -133,17 +157,17 @@ scripts/         Packaging, icon conversion, and application launcher
 
 ## Protocol and security design
 
-- Transport uses Python's standard-library `socket`, `ssl`, and `threading` modules. Certificate generation uses `cryptography`; QtNetwork supplies interface broadcast addresses.
+- Desktop transport uses Python's standard-library `socket`, `ssl`, and `threading` modules. Certificate generation uses `cryptography`; QtNetwork supplies interface broadcast addresses. The optional phone portal uses the standard-library HTTP server and `qrcode`; its distinct security model is described above.
 - TCP connections establish TLS and verify the pairing-code or stored SHA-256 certificate fingerprint before sending secrets or content.
 - Frames consist of a four-byte big-endian length followed by UTF-8 JSON. The wire version remains `1`. Existing `text`, `file`, and `pair` operations are preserved; v1.1 adds `folder` and authenticated `capabilities` requests.
 - Automatic clipboard sync checks for `clipboard-text-v1` support before sending a `text` request with `purpose=clipboard`, `mime=text/plain`, and `update_id`. This avoids sending automatic clipboard text to older versions. Manual text and single-file transfers remain compatible with older versions.
 - Files use metadata → ready acknowledgment → raw bytes → final acknowledgment. A matching SHA-256 hash is required before success is recorded. Folders send a manifest containing paths, entry types, sizes, and hashes, followed by file bytes in manifest order and a final batch acknowledgment.
 - A clipboard acknowledgment means the update entered the in-memory queue. The GUI subsequently writes it to the system clipboard.
-- Pairing secrets live briefly in memory, and trust tokens are randomly generated. Only trusted devices may send content. Pairing requests include the initiating device's certificate fingerprint to establish trust in both directions.
+- Desktop pairing secrets live briefly in memory, and trust tokens are randomly generated. Only trusted desktop devices may send through the desktop protocol. Pairing requests include the initiating device's certificate fingerprint to establish trust in both directions. The phone portal uses a separate temporary browser authorization.
 - Oversized frames and files are rejected. The service accepts at most eight inbound connections and applies connection, read, and total file-transfer timeouts. Streaming uses fixed-size buffers.
 - Single-file paths are reduced to filenames. Sanitization handles Windows special characters, reserved names, control characters, trailing dots/spaces, and UTF-8 byte limits. Receivers use private random directories and exclusively created temporary files, then rename on success and clean up on failure.
 - UDP advertisements contain the device name, random ID, certificate fingerprint, and port. Other devices on the local network can see this information. There is no telemetry.
-- The app does not yet provide resumable transfers, cancellation, per-transfer approval, encryption at rest, or a professional security audit. Trusted devices can send content while the app is open, so pair only with devices you trust.
+- The app does not yet provide resumable transfers, desktop transfer cancellation, per-transfer approval, encryption at rest, or a professional security audit. Trusted desktop devices can send content while the app is open, so pair only with devices you trust.
 
 ## Build and release
 
@@ -154,7 +178,7 @@ python scripts/build.py
 
 Build on the target operating system: Apple Silicon Python for macOS arm64, or x64 Python for Windows. Output goes to `dist/` and includes an application ZIP and SHA-256 checksum file. PyInstaller's `onedir` layout keeps bundled libraries available for troubleshooting and replacement.
 
-GitHub Actions uses `macos-14` (arm64) and `windows-2022` (x64). It checks the Python architecture, runs tests, packages the app, verifies icon resources, and starts the packaged executable for a smoke test. Test results are saved as JUnit artifacts.
+GitHub Actions uses `macos-14` (arm64) and `windows-2022` (x64). It checks the Python architecture, runs tests, packages the app, verifies icon resources, and starts the packaged executable for a smoke test, including QR generation and loading the bundled phone page. Test results are saved as JUnit artifacts.
 
 - Push to `main` or run the workflow manually to generate downloadable artifacts.
 - Push a `v*` tag to create a **release draft** after both platform builds succeed. The draft includes ZIPs and checksum files; publish it on GitHub after checking the results.
@@ -173,7 +197,7 @@ References: [GitHub-hosted runners](https://docs.github.com/en/actions/reference
 ## Possible next steps
 
 - Drag and drop, and multi-file queues
-- QR-code pairing
+- QR-code pairing between desktops, and HTTPS/native mobile support
 - Transfer cancellation, resume support, receive approval, and disk quotas
 - System tray mode, optional launch at login, and image clipboard sync
 - mDNS, further multi-interface discovery improvements, IPv6, and device renaming
