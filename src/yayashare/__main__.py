@@ -1,6 +1,9 @@
 import argparse
+import hashlib
+import os
 from pathlib import Path
 import sys
+import time
 
 
 def main():
@@ -8,12 +11,14 @@ def main():
     parser.add_argument("--data-dir", type=Path, help="Use an isolated local state directory")
     parser.add_argument("--port", type=int, default=45873)
     parser.add_argument("--no-discovery", action="store_true")
+    parser.add_argument("--minimized", action="store_true", help="Start in the system tray")
     parser.add_argument("--smoke-test", action="store_true", help="Launch UI briefly and exit")
     args = parser.parse_args()
     from PySide6.QtCore import QLockFile, QTimer
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
     from PySide6.QtWidgets import QApplication, QMessageBox
     from .gui import Window
-    from .storage import State
+    from .storage import State, data_dir
     app = QApplication(sys.argv[:1])
     app.setApplicationName("YayaShare")
     app.setOrganizationName("YayaShare")
@@ -26,18 +31,45 @@ def main():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("YayaShare.Desktop.1")
     app.setStyle("Fusion")
     try:
-        state = State(args.data_dir)
-        lock = QLockFile(str(state.root / "application.lock"))
+        root = (args.data_dir or data_dir()).resolve()
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock = QLockFile(str(root / "application.lock"))
+        lock.setStaleLockTime(0)
+        server_name = "YayaShare-" + hashlib.sha256(os.path.normcase(str(root)).encode()).hexdigest()[:32]
         if not lock.tryLock(0):
-            raise RuntimeError("YayaShare 已在运行，请使用已打开的窗口。")
-        window = Window(state, port=args.port, discover=not args.no_discovery)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                client = QLocalSocket()
+                client.connectToServer(server_name)
+                if client.waitForConnected(200):
+                    return 0
+                time.sleep(0.05)
+            return 1
+        server = QLocalServer()
+        server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        QLocalServer.removeServer(server_name)
+        if not server.listen(server_name):
+            raise RuntimeError(server.errorString())
+        state = State(root)
+        window = Window(state, port=args.port, discover=not args.no_discovery,
+                        tray_enabled=not args.smoke_test)
+        def wake():
+            while server.hasPendingConnections():
+                client = server.nextPendingConnection()
+                client.abort()
+                client.deleteLater()
+                window.activate_window()
+        server.newConnection.connect(wake)
     except Exception as exc:
         if args.smoke_test:
             print(str(exc), file=sys.stderr)
         else:
             QMessageBox.critical(None, "YayaShare 无法启动", str(exc))
         return 1
-    window.show()
+    if window.tray:
+        app.setQuitOnLastWindowClosed(False)
+    if not (args.minimized and window.tray):
+        window.show()
     if args.smoke_test:
         # Verify that a packaged app includes the phone page and QR dependency.
         from .web_portal import WebPortal

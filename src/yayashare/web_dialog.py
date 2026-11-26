@@ -1,11 +1,14 @@
 """Desktop controls for the optional phone portal."""
+from pathlib import Path
+import plistlib
 import time
+import uuid
 
 import qrcode
 from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QColor, QImage, QPainter, QPixmap
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QFileDialog,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QFileDialog,
     QHBoxLayout, QLabel, QLineEdit, QListWidget, QPlainTextEdit, QPushButton, QVBoxLayout)
 
 from .web_portal import WebPortal
@@ -42,6 +45,13 @@ class PortalDialog(QDialog):
         layout.addWidget(info)
         self.consent = QCheckBox("我了解：网页 HTTP 未加密，只在可信网络传普通内容")
         layout.addWidget(self.consent)
+        self.https = QCheckBox("使用 HTTPS（临时自签证书）")
+        self.https.toggled.connect(self.change_transport)
+        layout.addWidget(self.https)
+        self.export_certificate_button = QPushButton("导出手机信任证书…")
+        self.export_certificate_button.clicked.connect(self.export_certificate)
+        self.export_certificate_button.hide()
+        layout.addWidget(self.export_certificate_button)
         self.address = QComboBox()
         addresses = sorted({a.toString() for a in QNetworkInterface.allAddresses()
                             if a.protocol() == QAbstractSocket.NetworkLayerProtocol.IPv4Protocol and not a.isLoopback()})
@@ -66,7 +76,7 @@ class PortalDialog(QDialog):
         self.link.setPlaceholderText("临时连接地址")
         layout.addWidget(self.link)
         copy = QPushButton("复制临时连接地址")
-        copy.clicked.connect(lambda: QApplication.clipboard().setText(self.link.text()) if self.link.text() else None)
+        copy.clicked.connect(lambda: self.owner.copy_private_text(self.link.text()) if self.link.text() else None)
         layout.addWidget(copy)
         self.notice = QLabel("默认关闭。校园网设备隔离会阻止连接；可以换个人热点。")
         self.notice.setWordWrap(True)
@@ -94,16 +104,59 @@ class PortalDialog(QDialog):
         self.address.currentIndexChanged.connect(self.update_link)
         self.refresh()
 
+    def change_transport(self, https):
+        self.consent.setChecked(False)
+        self.consent.setText("我了解：手机须信任本次证书，浏览器才可启用安全网页功能" if https else
+                             "我了解：网页 HTTP 未加密，只在可信网络传普通内容")
+
+    def export_certificate(self):
+        ios_filter = "iPhone / iPad 证书描述文件 (*.mobileconfig)"
+        path, chosen = QFileDialog.getSaveFileName(
+            self, "导出本次手机入口的公开证书", "YayaShare-Phone",
+            f"{ios_filter};;公开证书 (*.cer)")
+        if not path or not self.portal:
+            return
+        try:
+            certificate = self.portal.public_certificate()
+            target = Path(path)
+            if chosen == ios_filter:
+                identifier = "io.github.kiyaya0829.yayashare.phone." + uuid.uuid4().hex
+                data = plistlib.dumps({
+                    "PayloadType": "Configuration", "PayloadVersion": 1,
+                    "PayloadUUID": str(uuid.uuid4()), "PayloadIdentifier": identifier,
+                    "PayloadDisplayName": "YayaShare Phone Portal",
+                    "PayloadContent": [{
+                        "PayloadType": "com.apple.security.root", "PayloadVersion": 1,
+                        "PayloadUUID": str(uuid.uuid4()), "PayloadIdentifier": identifier + ".root",
+                        "PayloadDisplayName": "YayaShare Phone Portal",
+                        "PayloadCertificateFileName": "YayaShare-Phone.cer",
+                        "PayloadContent": certificate,
+                    }],
+                })
+                suffix = ".mobileconfig"
+            else:
+                data, suffix = certificate, ".cer"
+            if target.suffix.lower() != suffix:
+                target = target.with_name(target.name + suffix)
+            target.write_bytes(data)
+            self.notice.setText("请经可信渠道把证书传到手机并启用 TLS 信任，然后扫码打开本次入口。")
+        except (OSError, ValueError) as exc:
+            self.notice.setText(f"无法导出证书：{exc}")
+
     def toggle(self):
         if self.portal:
             self.stop()
             return
         try:
             addresses = [self.address.itemData(i) or self.address.itemText(i) for i in range(self.address.count())]
-            self.portal = WebPortal(self.owner.state, addresses, event=self.owner.bridge.event.emit)
+            self.portal = WebPortal(self.owner.state, addresses, event=self.owner.bridge.event.emit,
+                                    https=self.https.isChecked())
             self.update_link()
             self.start.setText("关闭入口 / 撤销连接")
-            self.notice.setText("请用手机相机扫码；浏览器若提示连接未加密，这是本次局域网 HTTP 入口。")
+            if self.portal.tls:
+                self.notice.setText(f"请导出并在手机上信任本次证书。SHA-256 指纹：{self.portal.fingerprint}")
+            else:
+                self.notice.setText("请用手机相机扫码；本次入口使用未加密的局域网 HTTP。")
         except OSError:
             self.notice.setText("无法开启端口 45875，可能已有入口在运行。请关闭另一个实例后重试。")
         self.refresh()
@@ -135,6 +188,8 @@ class PortalDialog(QDialog):
         self.add_text.setEnabled(bool(self.portal) and not self.job)
         self.add_file.setEnabled(bool(self.portal) and not self.job)
         self.address.setEnabled(not self.portal or bool(self.portal.invite))
+        self.https.setEnabled(self.portal is None)
+        self.export_certificate_button.setVisible(bool(self.portal and self.portal.tls))
         self.items.clear()
         if self.portal:
             left = max(0, int(self.portal.expires - time.monotonic()))

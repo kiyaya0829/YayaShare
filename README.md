@@ -1,6 +1,6 @@
 # YayaShare 🐾
 
-Share text, clipboard contents, files, and folders between macOS and Windows on the same local network. No accounts, servers, or cloud storage. Built with Python and PySide6 as a small, approachable desktop project.
+Share text, screenshots, files, and folders between macOS and Windows over the local network or Tailscale. No accounts, servers, or cloud storage are required by YayaShare.
 
 ## Download and get started
 
@@ -15,20 +15,20 @@ These builds are not notarized with Apple Developer ID or signed with Windows Au
 **The application interface is currently in Chinese.** The steps below describe the corresponding controls in English.
 
 1. Connect both computers to the same Wi-Fi or local network and open YayaShare. Allow access on **private networks**: TCP `45873` handles encrypted transfers, and UDP `45874` handles discovery.
-2. On one computer, generate a pairing code and bring the complete code to the other computer through a trusted channel.
-3. On the other computer, select the discovered device, open the pairing/manual connection dialog, and paste the code. Pairing is needed only once; both computers save the trust relationship.
+2. On one computer, click **接收六位码配对** (Receive six-digit pairing). It accepts one request within two minutes.
+3. On the other computer, select the discovered device or enter its IPv4 address in **配对 / 手动连接**. Leave the code field blank and start pairing. Compare the six digits on both screens and confirm on each computer. For an older release, generate and share a 64-character one-time code through a trusted channel.
 4. Select a trusted device and enter text, or read the clipboard into the editor, then send the text.
-5. Choose a file or folder to send. Text is limited to 64 KiB; an individual file or an entire folder is limited to 2 GiB. SHA-256 hashes are calculated before streaming begins, and the progress bar updates during transfer.
+5. Choose a file or folder, or drop one or more items onto the window with a trusted device selected. Manual text is limited to 64 KiB and a file or folder to 2 GiB. Between updated peers, each file is hashed as it is sent. The progress area lets you cancel a transfer in progress.
 6. Use the recent items list to view received text and file or folder locations, or open the receive folder. The app never runs received files automatically.
 
 ## Features
 
-### Phone browser portal (v1.2)
+### Phone browser portal
 
 Use an iPhone, iPad, or Android browser without installing an app. The desktop app serves the page locally; no hosted website or cloud account is involved.
 
-1. Upgrade the computer to v1.2 and connect your phone to the same reachable local network.
-2. Click **手机网页 · 扫码收发文字和文件** (Phone browser) in the desktop window. Read and acknowledge the **unencrypted HTTP** notice, then click **开启手机入口** (Open phone portal). It is off by default.
+1. Connect your phone to the same reachable local network.
+2. Click **手机网页 · 扫码收发文字和文件** (Phone browser) in the desktop window. Choose the optional HTTPS mode before acknowledging the transport notice, then click **开启手机入口** (Open phone portal).
 3. Choose the computer's Wi-Fi IPv4 address if multiple addresses appear. Scan the QR code with the phone camera and open it in Safari or your browser. You can also copy the temporary link. Treat the complete link as a temporary password and do not forward it.
 4. On the phone, enter text and tap **发送文字**, or choose photos/files and tap **发送选中文件**. Wait for the message confirming receipt on the computer. Received items appear in the desktop history and ordinary receive directory.
 5. To send back to the phone, explicitly add text or a file in the desktop portal window. It appears under **从电脑接收** on the phone. Copy the text or download the file. On iPhone, downloads can be found in the browser's download list / Files app; photos are not automatically saved to the Photos library.
@@ -42,26 +42,26 @@ The link authorizes **one browser session** and can be used only once. Refreshin
 - Browser clipboard access varies: the Copy button falls back to selecting text for manual copying. Automatic background clipboard sync is available only between desktop apps. The app does not convert photos or guarantee their original format; the browser chooses the uploaded representation.
 - Allow **TCP 45875** on the computer's trusted/private network while the portal is open. Campus/guest Wi-Fi client isolation can block even a correct QR link. Use a trusted router or personal hotspot when necessary; scanning cannot bypass network isolation. Do not forward this port to the internet.
 
-**Security tradeoff:** the phone portal uses HTTP to avoid requiring a self-signed certificate on the phone. Content and session cookies are **not encrypted in transit** and can be observed or modified by an attacker on the network. The temporary token, one-use authorization, exact IP/Host checks, same-origin checks, and disabled cross-origin access limit unauthorized requests; they do not replace TLS. Use only on trusted networks for non-sensitive content. Desktop-to-desktop sharing continues to use pinned TLS.
+HTTP is the default for the phone portal and sends content and cookies unencrypted. HTTPS generates a temporary self-signed certificate with the listed IPv4 addresses and displays its SHA-256 fingerprint. Export the public certificate from the dialog and transfer it to the phone through a trusted channel. On iPhone or iPad, export the configuration profile, install it and enable full TLS trust before scanning the QR code. Remove the profile after using the portal. The phone must trust the certificate and treat the page as a secure context to use the modern clipboard API. [Apple certificate trust instructions](https://support.apple.com/en-ie/102390)
 
 ### Automatic clipboard sync
 
-Upgrade both computers to v1.1 or later and enable **Clipboard Sync** on each. Copy new text on either computer, then paste it on the other.
+Enable **Clipboard Sync** on both computers. To sync screenshots and clipboard pictures, also enable **同步截图和剪贴板图片** on both.
 
-- Sync is **off at every startup**. Enabling it does not send existing clipboard contents.
-- Newly copied text is sent to **all paired devices**. Only text up to 64 KiB is supported; images, file lists, and clipboard data containing file URLs are excluded.
-- Automatically synchronized text is not saved to receive history or disk.
+- Sync is off on first launch and the app remembers your choices. Enabling it takes the current clipboard as its baseline.
+- New copies go to all paired devices. Updated peers support 512 KiB of UTF-8 text or a 16 MiB PNG, with a 24-megapixel decoded image limit. Older clipboard-capable peers receive up to 64 KiB of text. Clipboard file URLs are excluded.
+- Synced contents stay in memory and are omitted from receive history.
 - The switch controls both sending and receiving. Turning it off clears queued updates but cannot recall an update already sent over the network.
-- The app must stay running. Closing its window exits the app; there is no system tray mode yet. Offline devices produce an error without repeatedly retrying old clipboard contents.
+- Closing the window hides the app when a tray icon is available. Use the tray menu to reopen it or quit. Launch with `--minimized` to start in the tray, including from a login shortcut. Launching a second copy opens the existing window for that data directory.
 - Sensitive text copied while sync is on is also shared with trusted devices. Enable sync only when you need it.
 
 Network transfers use a separate background task. Qt accesses the system clipboard on the GUI thread, using change notifications and 400 ms polling to detect copies while the app is in the background.
 
-Each update has a unique ID; the latest 512 IDs are tracked for deduplication. Before writing received text, the app updates its local source state, then reads back normalized clipboard text as a baseline to avoid echoes. If both computers copy text simultaneously, each may receive the other's latest update. This version prevents endless back-and-forth syncing but does not guarantee a global ordering of simultaneous updates. It queues at most 64 incoming updates and retains only the latest pending local update.
+The app deduplicates by update ID and reads back received clipboard contents as a baseline after writing them. For pictures it baselines the SHA-256 of the encoded PNG. The incoming queue holds up to 64 updates, including at most one image.
 
 ### Folder transfers
 
-Folder transfers preserve relative paths, Unicode filenames, and empty directories. Each batch is saved in a separate random receive directory.
+Folder transfers preserve relative paths, Unicode filenames, and empty directories. Completed folders appear directly in the receive directory.
 
 - Up to 2 GiB total, 2048 entries, 32 path components, and 512 UTF-8 bytes per relative path.
 - Incompatible filenames are sanitized; for example, `CON.txt` becomes `_CON.txt`.
@@ -81,7 +81,7 @@ If the other computer does not appear:
 
 - Allow about 3–12 seconds for discovery. Keep both computers awake and the app open.
 - Find the other computer's local IPv4 address in its network settings, such as `192.168.1.20`, and enter its IP and port in the pairing/manual connection dialog.
-- If a trusted device changes IP address, select it, enter the new address, and leave the pairing code blank to update its connection details.
+- If a trusted device changes IP address, select it, enter the new address, and leave the pairing code blank to update its connection details. With Tailscale running on both computers, peers exchange their Tailscale IPv4 addresses during pairing or authenticated capability exchange. The app tries any recently discovered LAN address first and then falls back to Tailscale. For a first pairing outside the LAN, enter the other computer's Tailscale IPv4 manually.
 - Guest or campus Wi-Fi may isolate devices. Sharing a Wi-Fi name does not guarantee connectivity; try your own router or hotspot.
 - Check VPN and firewall settings. On macOS, allow YayaShare under **System Settings → Privacy & Security → Local Network**. Port forwarding is unnecessary; avoid exposing the app to the public internet.
 - An “address already in use” error can mean another instance is running. Only one instance may use a given data directory.
@@ -94,7 +94,7 @@ If the other computer does not appear:
 | Windows | `%LOCALAPPDATA%\YayaShare` |
 | Linux (from source) | `~/.local/share/YayaShare` |
 
-Received files are stored under `Received/<random batch>/<sanitized filename>` inside the data directory. Repeated filenames are stored separately without overwriting earlier files. History keeps the latest 100 items; **removing an item from history does not delete its received files**.
+Desktop files and folders are published directly under `Received` after verification. Use **更改接收目录** to pick another location. Duplicate names get a suffix such as `report (2).pdf`; existing history continues to point at the original paths. Phone uploads use separate receive batches under the selected directory. History keeps the latest 100 items.
 
 Manual text history, trust tokens, and certificates stay on your computer and are not uploaded to the cloud. Local data is not encrypted at rest, so protect your operating system account and disk.
 
@@ -160,14 +160,14 @@ scripts/         Packaging, icon conversion, and application launcher
 - Desktop transport uses Python's standard-library `socket`, `ssl`, and `threading` modules. Certificate generation uses `cryptography`; QtNetwork supplies interface broadcast addresses. The optional phone portal uses the standard-library HTTP server and `qrcode`; its distinct security model is described above.
 - TCP connections establish TLS and verify the pairing-code or stored SHA-256 certificate fingerprint before sending secrets or content.
 - Frames consist of a four-byte big-endian length followed by UTF-8 JSON. The wire version remains `1`. Existing `text`, `file`, and `pair` operations are preserved; v1.1 adds `folder` and authenticated `capabilities` requests.
-- Automatic clipboard sync checks for `clipboard-text-v1` support before sending a `text` request with `purpose=clipboard`, `mime=text/plain`, and `update_id`. This avoids sending automatic clipboard text to older versions. Manual text and single-file transfers remain compatible with older versions.
+- Authenticated capability negotiation can continue into a transfer on the same pinned TLS connection. Short-lived capability caching skips repeat probes. `clipboard-text-v2` and `clipboard-image-v1` use bounded binary bodies and SHA-256. `stream-v2` provides a digest trailer per file and falls back to prehashed transfers for older peers.
 - Files use metadata → ready acknowledgment → raw bytes → final acknowledgment. A matching SHA-256 hash is required before success is recorded. Folders send a manifest containing paths, entry types, sizes, and hashes, followed by file bytes in manifest order and a final batch acknowledgment.
 - A clipboard acknowledgment means the update entered the in-memory queue. The GUI subsequently writes it to the system clipboard.
 - Desktop pairing secrets live briefly in memory, and trust tokens are randomly generated. Only trusted desktop devices may send through the desktop protocol. Pairing requests include the initiating device's certificate fingerprint to establish trust in both directions. The phone portal uses a separate temporary browser authorization.
 - Oversized frames and files are rejected. The service accepts at most eight inbound connections and applies connection, read, and total file-transfer timeouts. Streaming uses fixed-size buffers.
 - Single-file paths are reduced to filenames. Sanitization handles Windows special characters, reserved names, control characters, trailing dots/spaces, and UTF-8 byte limits. Receivers use private random directories and exclusively created temporary files, then rename on success and clean up on failure.
 - UDP advertisements contain the device name, random ID, certificate fingerprint, and port. Other devices on the local network can see this information. There is no telemetry.
-- The app does not yet provide resumable transfers, desktop transfer cancellation, per-transfer approval, encryption at rest, or a professional security audit. Trusted desktop devices can send content while the app is open, so pair only with devices you trust.
+- The app does not yet provide resumable transfers, per-transfer approval, encryption at rest, or a professional security audit. Trusted desktop devices can send content while the app is open, so pair only with devices you trust.
 
 ## Build and release
 
@@ -197,9 +197,9 @@ References: [GitHub-hosted runners](https://docs.github.com/en/actions/reference
 ## Possible next steps
 
 - Drag and drop, and multi-file queues
-- QR-code pairing between desktops, and HTTPS/native mobile support
+- QR-code pairing between desktops and native mobile support
 - Transfer cancellation, resume support, receive approval, and disk quotas
-- System tray mode, optional launch at login, and image clipboard sync
+- A built-in launch-at-login setting
 - mDNS, further multi-interface discovery improvements, IPv6, and device renaming
 - Apple notarization, Windows signing, and automatic updates
 

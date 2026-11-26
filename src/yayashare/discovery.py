@@ -1,10 +1,31 @@
 """IPv4 UDP discovery. Advertisements are hints, never trust credentials."""
 import json
+import ipaddress
 import socket
 import threading
 import time
 
 DISCOVERY_PORT = 45874
+TAILNET = ipaddress.IPv4Network("100.64.0.0/10")
+
+
+def is_tailnet(host):
+    try:
+        return ipaddress.IPv4Address(host) in TAILNET
+    except (ValueError, TypeError):
+        return False
+
+
+def tailscale_address():
+    from PySide6.QtNetwork import QNetworkInterface
+    return next((address.toString() for address in QNetworkInterface.allAddresses()
+                 if is_tailnet(address.toString())), None)
+
+
+def peer_at(peer, host, port, seen=None):
+    if is_tailnet(host):
+        return {**peer, "tailscale_host": host, "tailscale_port": port}
+    return {**peer, "lan_host": host, "lan_port": port, "lan_seen": seen or time.monotonic()}
 
 
 def broadcast_addresses():

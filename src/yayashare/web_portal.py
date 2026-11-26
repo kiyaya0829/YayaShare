@@ -1,4 +1,4 @@
-"""Opt-in, short-lived LAN HTTP portal. This is NOT the desktop TLS protocol.
+"""Opt-in, short-lived phone portal with optional HTTPS.
 
 Only explicit exports are readable; incoming files use private random batches.
 The GUI must obtain acknowledgment of HTTP's lack of transport encryption.
@@ -14,13 +14,18 @@ from pathlib import Path
 import secrets
 import shutil
 import socket
+import ssl
 import stat
 import threading
 import time
 from urllib.parse import quote, unquote, urlsplit
 import uuid
 
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import Encoding
+
 from .storage import safe_name
+from .security import certificate
 
 WEB_PORT = 45875
 MAX_UPLOAD = 256 * 1024**2
@@ -65,7 +70,17 @@ class LimitedServer(ThreadingHTTPServer):
 
     def process_request_thread(self, request, client_address):
         try:
+            if self.portal.tls:
+                with self.conn_lock:
+                    secure = self.portal.tls.wrap_socket(request, server_side=True,
+                                                         do_handshake_on_connect=False)
+                    self.connections.discard(request)
+                    request = secure
+                    self.connections.add(request)
+                request.do_handshake()
             super().process_request_thread(request, client_address)
+        except OSError:
+            request.close()
         finally:
             with self.conn_lock:
                 self.connections.discard(request)
@@ -77,7 +92,7 @@ class LimitedServer(ThreadingHTTPServer):
 
 
 class WebPortal:
-    def __init__(self, state, addresses, *, host="0.0.0.0", port=WEB_PORT, lifetime=1800, event=None):
+    def __init__(self, state, addresses, *, host="0.0.0.0", port=WEB_PORT, lifetime=1800, event=None, https=False):
         self.state = state
         self.lock = threading.RLock()
         self.event = event or (lambda *_: None)
@@ -93,9 +108,14 @@ class WebPortal:
         self.spool = state.root / (".web-export-" + uuid.uuid4().hex)
         self.spool.mkdir(mode=0o700)
         try:
+            self.tls = None
+            self.scheme = "https" if https else "http"
+            self.fingerprint = None
+            if https:
+                self.tls, self.fingerprint = certificate(self.spool, addresses=self.addresses)
             self.server = LimitedServer((host, port), self)
         except Exception:
-            self.spool.rmdir()
+            shutil.rmtree(self.spool)
             raise
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
@@ -104,10 +124,16 @@ class WebPortal:
     def active(self):
         return not self.stopped.is_set() and time.monotonic() < self.expires
 
+    def public_certificate(self):
+        if not self.tls or not self.active():
+            raise ValueError("HTTPS 入口未开启")
+        cert = x509.load_pem_x509_certificate((self.spool / "certificate.pem").read_bytes())
+        return cert.public_bytes(Encoding.DER)
+
     def url(self, address):
         if address not in self.addresses:
             raise ValueError("未知本机地址")
-        return f"http://{address}:{self.port}/#{self.invite}"
+        return f"{self.scheme}://{address}:{self.port}/#{self.invite}"
 
     def authorize(self, value):
         with self.lock:
@@ -265,7 +291,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self.portal.active():
             raise PortalError(403, "手机入口已关闭或过期，请在电脑重新开启")
         origin = self.headers.get("Origin")
-        if (write or origin) and origin != "http://" + host:
+        if (write or origin) and origin != f"{self.portal.scheme}://{host}":
             raise PortalError(403, "不允许跨站请求")
         if self.headers.get("Sec-Fetch-Site", "same-origin") not in ("same-origin", "none"):
             raise PortalError(403, "不允许跨站请求")
@@ -321,7 +347,8 @@ class Handler(BaseHTTPRequestHandler):
             if write and path == "/api/connect":
                 session = self.portal.authorize(self._json().get("token"))
                 seconds = max(0, int(self.portal.expires - time.monotonic()))
-                return self._reply(200, {"ok": True}, cookie=f"yaya_web={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age={seconds}")
+                secure = "; Secure" if self.portal.tls else ""
+                return self._reply(200, {"ok": True}, cookie=f"yaya_web={session}; HttpOnly; SameSite=Strict; Path=/; Max-Age={seconds}{secure}")
             if not self.portal.authenticated(self.headers.get("Cookie")):
                 raise PortalError(401, "请扫描电脑上的二维码连接；已使用的链接不能再次授权。")
             if not write and path == "/api/items":

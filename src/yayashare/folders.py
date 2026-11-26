@@ -7,7 +7,6 @@ import shutil
 import stat
 import time
 import unicodedata
-import uuid
 
 from .storage import safe_name
 
@@ -25,7 +24,7 @@ def portable_path(value):
     return "/".join(safe_name(p) for p in parts)
 
 
-def validate_manifest(entries):
+def validate_manifest(entries, stream=False):
     if not isinstance(entries, list) or len(entries) > MAX_ENTRIES:
         raise ValueError("文件夹最多包含 2048 项")
     result, used, spelling, total = [], {}, {}, 0
@@ -43,7 +42,7 @@ def validate_manifest(entries):
             size, sha = entry.get("size"), entry.get("sha256")
             if type(size) is not int or not 0 <= size <= MAX_TOTAL:
                 raise ValueError("无效文件大小")
-            if not isinstance(sha, str) or not re.fullmatch(r"[a-f0-9]{64}", sha):
+            if not stream and (not isinstance(sha, str) or not re.fullmatch(r"[a-f0-9]{64}", sha)):
                 raise ValueError("无效文件校验值")
             total += size
         used[key] = kind
@@ -61,10 +60,16 @@ def validate_manifest(entries):
 
 
 def is_link(path):
-    return path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction())
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or (
+        getattr(info, "st_reparse_tag", 0) == getattr(stat, "IO_REPARSE_TAG_MOUNT_POINT", None))
 
 
-def manifest(root):
+def manifest(root, stream=False, cancel=None):
+    from .protocol import check_cancel, file_hash
     root = Path(root)
     if is_link(root) or not root.is_dir():
         raise ValueError("请选择普通文件夹，不支持符号链接")
@@ -73,6 +78,7 @@ def manifest(root):
         raise error
     for directory, dirs, files in os.walk(root, followlinks=False, onerror=walk_error):
         for name in sorted(dirs + files):
+            check_cancel(cancel)
             path = Path(directory) / name
             if is_link(path):
                 raise ValueError("文件夹包含符号链接，请先移除链接")
@@ -83,36 +89,34 @@ def manifest(root):
             elif stat.S_ISREG(meta.st_mode):
                 if meta.st_size > MAX_TOTAL:
                     raise ValueError("文件超过 2 GiB")
-                with path.open("rb") as source:
-                    sha = hashlib.file_digest(source, "sha256").hexdigest()
-                entry.update(kind="file", size=meta.st_size, sha256=sha)
+                entry.update(kind="file", size=meta.st_size)
+                if not stream:
+                    with path.open("rb") as source:
+                        entry["sha256"] = file_hash(source, cancel)
                 sources.append(path)
             else:
                 raise ValueError("文件夹包含特殊文件")
             entries.append(entry)
             if len(entries) > MAX_ENTRIES:
                 raise ValueError("文件夹最多包含 2048 项")
-    validated, total = validate_manifest(entries)
+    validated, total = validate_manifest(entries, stream)
     return validated, sources, total
 
 
 def receive_folder(service, conn, request, peer):
-    from .protocol import read_exact, send_json
+    from .protocol import read_exact, send_json, transfer_digest
     name = safe_name(request.get("name"))
-    entries, total = validate_manifest(request.get("entries"))
-    if shutil.disk_usage(service.state.inbox).free < total + 16 * 1024**2:
+    stream = request.get("stream") == 2
+    entries, total = validate_manifest(request.get("entries"), stream)
+    inbox = service.state.inbox
+    if shutil.disk_usage(inbox).free < total + 16 * 1024**2:
         raise ValueError("接收磁盘空间不足")
-    batch = service.state.inbox / uuid.uuid4().hex[:12]
-    staging = batch / ".partial"
-    target = batch / name
-    if target == staging:
-        raise ValueError("无效文件夹名称")
-    # Fail early on Windows installations without long-path support.
-    if os.name == "nt" and any(len(str(staging / e["path"])) > 240 for e in entries):
-        raise ValueError("接收路径过长，请缩短文件夹层级或数据目录路径")
-    staging.mkdir(parents=True, mode=0o700)
-    complete = False
-    try:
+    with service.state.staging(inbox) as batch:
+        staging = batch / ".partial"
+        # Fail early on Windows installations without long-path support.
+        if os.name == "nt" and any(len(str(staging / e["path"])) > 240 for e in entries):
+            raise ValueError("接收路径过长，请缩短文件夹层级或数据目录路径")
+        staging.mkdir(mode=0o700)
         for entry in sorted(entries, key=lambda e: e["path"].count("/")):
             if entry["kind"] == "directory":
                 (staging / entry["path"]).mkdir(mode=0o700)
@@ -132,44 +136,50 @@ def receive_folder(service, conn, request, peer):
                     remaining -= len(block)
                 out.flush()
                 os.fsync(out.fileno())
-            if sha.hexdigest() != entry["sha256"]:
+            if sha.hexdigest() != transfer_digest(conn, entry.get("sha256"), stream):
                 raise ValueError("文件夹内文件校验失败，请重试")
-        staging.rename(target)
-        service.state.record("folder", peer["name"], str(target))
-        complete = True
-    finally:
-        if not complete:
-            shutil.rmtree(batch)
+        service.state.publish(staging, inbox, name, "folder", peer["name"])
 
 
-def send_folder(service, peer, path, progress):
-    from .protocol import send_json, response
-    from .security import pinned_socket
+def send_folder(service, peer, path, progress, stream, cancel):
+    from .protocol import check_cancel, send_json, response
     path = Path(path)
-    entries, sources, total = manifest(path)
-    with pinned_socket(peer["host"], peer["port"], peer["fingerprint"]) as conn:
+    entries, sources, total = manifest(path, stream, cancel)
+    check_cancel(cancel)
+    with service.connect(peer) as conn:
         send_json(conn, {"version": 1, "op": "folder", "id": service.state.identity["id"],
-                         "token": peer["token"], "name": path.name, "entries": entries})
+                         "token": peer["token"], "name": path.name, "entries": entries,
+                         **({"stream": 2} if stream else {})})
         response(conn)
         sent = 0
-        source_iter = iter(sources)
-        for entry in entries:
-            if entry["kind"] != "file":
-                continue
-            source_path = next(source_iter)
+        for entry, source_path in zip((e for e in entries if e["kind"] == "file"), sources, strict=True):
+            check_cancel(cancel)
             if is_link(source_path) or any(is_link(p) for p in source_path.parents):
                 raise ValueError("源路径在发送前变成了链接")
+            sha = hashlib.sha256()
             with source_path.open("rb") as source:
+                meta = os.fstat(source.fileno())
+                if not stat.S_ISREG(meta.st_mode) or meta.st_size != entry["size"]:
+                    raise ValueError("文件在传输时被修改，请重试")
                 remaining = entry["size"]
                 while remaining:
+                    check_cancel(cancel)
                     block = source.read(min(CHUNK, remaining))
                     if not block:
                         raise ValueError("文件在传输时被修改，请重试")
                     conn.sendall(block)
+                    if stream:
+                        sha.update(block)
                     remaining -= len(block)
                     sent += len(block)
                     if progress:
                         progress(int(sent * 100 / max(total, 1)))
+                if stream:
+                    check_cancel(cancel)
+                    current = os.fstat(source.fileno())
+                    if (current.st_size, current.st_mtime_ns) != (meta.st_size, meta.st_mtime_ns):
+                        raise ValueError("文件在传输时被修改，请重试")
+                    send_json(conn, {"sha256": sha.hexdigest()})
         response(conn)
-        if progress:
-            progress(100)
+    if progress:
+        progress(100)

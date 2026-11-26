@@ -1,22 +1,25 @@
 """Qt Widgets UI. Network and hashing work never run on the GUI thread."""
 from pathlib import Path
 import ipaddress
+import threading
 import time
 
-from PySide6.QtCore import QObject, QThread, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QIcon
+from PySide6.QtCore import QBuffer, QByteArray, QEvent, QIODevice, QObject, QThread, QTimer, Qt, QUrl, Signal
+from PySide6.QtGui import QDesktopServices, QIcon, QImage, QImageReader
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
-    QPushButton, QSplitter, QVBoxLayout, QWidget, QCheckBox)
+    QPushButton, QSplitter, QVBoxLayout, QWidget, QCheckBox, QMenu, QSystemTrayIcon)
 
-from .discovery import Discovery
+from .clipboard import MAX_IMAGE
+from .discovery import Discovery, peer_at
 from .protocol import PORT, Service
 from .storage import State
 
 
 class Bridge(QObject):
     event = Signal(str, str)
+    pairing = Signal(str, str, object, object)
 
 
 class Job(QThread):
@@ -26,6 +29,7 @@ class Job(QThread):
     def __init__(self, fn, parent=None):
         super().__init__(parent)
         self.fn = fn
+        self.cancel_event = threading.Event()
 
     def run(self):
         try:
@@ -36,12 +40,14 @@ class Job(QThread):
 
 
 class Window(QMainWindow):
-    def __init__(self, state=None, port=PORT, discover=True):
+    def __init__(self, state=None, port=PORT, discover=True, tray_enabled=True):
         super().__init__()
         self.state = state or State()
         self.bridge = Bridge()
         self.bridge.event.connect(self.network_event)
-        self.service = Service(self.state, port=port, event=self.bridge.event.emit)
+        self.bridge.pairing.connect(self.show_pairing_confirmation)
+        self.service = Service(self.state, port=port, event=self.bridge.event.emit,
+                               confirm_pairing=self.confirm_pairing)
         self.service.start()
         self.discovery = Discovery(self.service.info)
         if discover:
@@ -50,12 +56,18 @@ class Window(QMainWindow):
         self.clipboard_job = None
         self.clipboard_pending = None
         self.applying_clipboard = False
+        self.cached_image = QImage()
+        self.cached_png = None
+        self.last_clipboard_image = None
+        self.quitting = False
+        self.tray = None
         self.last_history = None
         self.last_devices = None
         self.setWindowTitle("YayaShare · 局域网共享")
         self.setWindowIcon(QIcon(str(Path(__file__).parent / "assets/icon.png")))
         self.resize(940, 680)
         self.setMinimumSize(740, 560)
+        self.setAcceptDrops(True)
         root = QWidget()
         self.setCentralWidget(root)
         layout = QVBoxLayout(root)
@@ -77,6 +89,9 @@ class Window(QMainWindow):
         self.invite_btn = QPushButton("生成我的配对码")
         self.invite_btn.clicked.connect(self.show_invitation)
         row.addWidget(self.invite_btn)
+        sas = QPushButton("接收六位码配对")
+        sas.clicked.connect(self.allow_pairing)
+        row.addWidget(sas)
         self.forget_btn = QPushButton("取消信任")
         self.forget_btn.clicked.connect(self.forget)
         row.addWidget(self.forget_btn)
@@ -84,10 +99,11 @@ class Window(QMainWindow):
         self.web_btn = QPushButton("手机网页 · 扫码收发文字和文件")
         self.web_btn.clicked.connect(self.show_web_portal)
         layout.addWidget(self.web_btn)
-        self.sync_toggle = QCheckBox("Clipboard Sync · 自动同步纯文本到所有已配对设备")
-        self.sync_toggle.setToolTip("默认关闭，每次启动需重新开启。两边均需开启；仅同步开启后新复制的纯文本。")
-        self.sync_toggle.toggled.connect(self.configure_clipboard)
+        self.sync_toggle = QCheckBox("Clipboard Sync · 自动同步到所有已配对设备")
+        self.sync_toggle.setToolTip("两边都需开启。设置会保留，仅同步开启后新复制的内容。")
         layout.addWidget(self.sync_toggle)
+        self.image_toggle = QCheckBox("同步截图和剪贴板图片")
+        layout.addWidget(self.image_toggle)
         self.sync_status = QLabel("剪贴板同步已关闭")
         self.sync_status.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.sync_status)
@@ -97,6 +113,7 @@ class Window(QMainWindow):
         left.setContentsMargins(0, 0, 8, 0)
         left.addWidget(QLabel("发送文字"))
         self.editor = QPlainTextEdit()
+        self.editor.viewport().installEventFilter(self)
         self.editor.setPlaceholderText("这里的文字在点击发送时共享。\n自动剪贴板同步由上方开关控制。")
         left.addWidget(self.editor)
         actions = QHBoxLayout()
@@ -123,6 +140,7 @@ class Window(QMainWindow):
         self.history_list.currentRowChanged.connect(self.preview)
         right.addWidget(self.history_list, 2)
         self.detail = QPlainTextEdit()
+        self.detail.viewport().installEventFilter(self)
         self.detail.setReadOnly(True)
         self.detail.setPlaceholderText("选择记录查看全文或文件位置")
         right.addWidget(self.detail, 1)
@@ -131,8 +149,11 @@ class Window(QMainWindow):
         copy.clicked.connect(lambda: QApplication.clipboard().setText(self.detail.toPlainText()))
         buttons.addWidget(copy)
         folder = QPushButton("打开接收文件夹")
-        folder.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.state.inbox))))
+        folder.clicked.connect(self.open_inbox)
         buttons.addWidget(folder)
+        change_folder = QPushButton("更改接收目录")
+        change_folder.clicked.connect(self.choose_inbox)
+        buttons.addWidget(change_folder)
         right.addLayout(buttons)
         split.addWidget(history_panel)
         split.setSizes([430, 430])
@@ -141,6 +162,10 @@ class Window(QMainWindow):
         self.progress.setRange(0, 100)
         self.progress.hide()
         layout.addWidget(self.progress)
+        self.cancel_btn = QPushButton("取消传输")
+        self.cancel_btn.clicked.connect(self.cancel_transfer)
+        self.cancel_btn.hide()
+        layout.addWidget(self.cancel_btn)
         self.status = QLabel("准备就绪。先在另一台设备生成配对码，再在这里配对。")
         self.status.setTextFormat(Qt.TextFormat.PlainText)
         self.status.setWordWrap(True)
@@ -164,7 +189,87 @@ class Window(QMainWindow):
         self.clipboard_timer.timeout.connect(self.poll_clipboard)
         self.clipboard_timer.start(400)
         QApplication.clipboard().dataChanged.connect(self.poll_clipboard)
+        settings = self.state.settings
+        self.sync_toggle.setChecked(settings.get("clipboard_sync") is True)
+        self.image_toggle.setChecked(settings.get("clipboard_images") is True)
+        self.set_clipboard_options()
+        self.sync_toggle.toggled.connect(self.configure_clipboard)
+        self.image_toggle.toggled.connect(self.configure_clipboard)
+        if tray_enabled and QSystemTrayIcon.isSystemTrayAvailable():
+            self.create_tray()
         self.refresh()
+
+    def create_tray(self):
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip("YayaShare")
+        menu = QMenu(self)
+        menu.addAction("打开主窗口", self.activate_window)
+        toggle = menu.addAction("Clipboard Sync")
+        toggle.setCheckable(True)
+        toggle.setChecked(self.sync_toggle.isChecked())
+        toggle.toggled.connect(self.sync_toggle.setChecked)
+        self.sync_toggle.toggled.connect(toggle.setChecked)
+        menu.addAction("手机网页入口", self.tray_web_portal)
+        menu.addAction("打开接收文件夹", self.open_inbox)
+        menu.addAction("彻底退出", self.quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.tray_activated)
+        self.tray.show()
+
+    def tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.activate_window()
+
+    def activate_window(self):
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def tray_web_portal(self):
+        self.activate_window()
+        self.show_web_portal()
+
+    def open_inbox(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.state.inbox)))
+
+    def choose_inbox(self):
+        directory = QFileDialog.getExistingDirectory(self, "选择接收保存目录", str(self.state.inbox))
+        if directory:
+            try:
+                self.state.configure(receive_directory=directory)
+                self.status.setText(f"接收目录已设为 {self.state.inbox}")
+            except (OSError, ValueError) as exc:
+                self.status.setText(f"无法更改接收目录：{exc}")
+
+    def accepts_paths(self, event):
+        urls = event.mimeData().urls()
+        return bool(urls) and all(url.isLocalFile() for url in urls)
+
+    def eventFilter(self, watched, event):
+        kind = event.type()
+        if kind in (QEvent.Type.DragEnter, QEvent.Type.DragMove, QEvent.Type.Drop) and self.accepts_paths(event):
+            if kind == QEvent.Type.Drop:
+                self.dropEvent(event)
+            else:
+                self.dragEnterEvent(event)
+            return True
+        return super().eventFilter(watched, event)
+
+    def dragEnterEvent(self, event):
+        if not self.job and self.accepts_paths(event):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = [url.toLocalFile() for url in event.mimeData().urls()]
+        if self.job or not paths or not all(paths):
+            return
+        peer = self.trusted()
+        if peer:
+            event.acceptProposedAction()
+            self.send_paths(peer, paths)
 
     def clipboard_text(self):
         mime = QApplication.clipboard().mimeData()
@@ -178,10 +283,73 @@ class Window(QMainWindow):
         dialog.exec()
         dialog.deleteLater()
 
-    def configure_clipboard(self, enabled):
-        self.service.clipboard.configure(enabled, self.clipboard_text())
+    def clipboard_image(self):
+        if not self.image_toggle.isChecked():
+            return None
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData()
+        if mime is None or not mime.hasImage() or mime.hasUrls():
+            self.cached_image = QImage()
+            self.cached_png = None
+            return None
+        image = clipboard.image()
+        if image.isNull() or image.width() * image.height() > 24_000_000:
+            self.cached_image = QImage()
+            self.cached_png = None
+            return None
+        if image == self.cached_image:
+            return self.cached_png
+        self.cached_image = image
+        self.cached_png = None
+        buffer = QBuffer()
+        buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+        if image.save(buffer, "PNG") and buffer.size() <= MAX_IMAGE:
+            self.cached_png = bytes(buffer.data())
+        return self.cached_png
+
+    def write_clipboard(self, content):
+        clipboard = QApplication.clipboard()
+        if isinstance(content, str):
+            clipboard.setText(content)
+            return
+        buffer = QBuffer()
+        buffer.setData(QByteArray(content))
+        buffer.open(QIODevice.OpenModeFlag.ReadOnly)
+        reader = QImageReader(buffer, b"png")
+        size = reader.size()
+        if size.isValid() and 0 < size.width() * size.height() <= 24_000_000:
+            image = reader.read()
+            if not image.isNull():
+                clipboard.setImage(image)
+
+    def copy_private_text(self, text):
+        self.applying_clipboard = True
+        try:
+            QApplication.clipboard().setText(text)
+            self.service.clipboard.baseline(self.clipboard_text())
+            self.last_clipboard_image = None
+        finally:
+            self.applying_clipboard = False
+
+    def configure_clipboard(self, _checked):
+        try:
+            self.state.configure(clipboard_sync=self.sync_toggle.isChecked(),
+                                 clipboard_images=self.image_toggle.isChecked())
+        except OSError as exc:
+            self.status.setText(f"无法保存剪贴板设置：{exc}")
+        self.set_clipboard_options()
+
+    def set_clipboard_options(self):
+        enabled = self.sync_toggle.isChecked()
+        if not enabled or not self.image_toggle.isChecked():
+            self.cached_image = QImage()
+            self.cached_png = None
+        self.last_clipboard_image = self.clipboard_image() if enabled else None
+        self.service.clipboard.configure(enabled, self.clipboard_text(),
+                                         images=self.image_toggle.isChecked(),
+                                         image=self.last_clipboard_image)
         self.clipboard_pending = None
-        self.sync_status.setText("已开启：新复制的纯文本将同步到所有已配对设备（两边均需开启）" if enabled else "剪贴板同步已关闭")
+        self.sync_status.setText("剪贴板同步已开启（两边均需开启）" if enabled else "剪贴板同步已关闭")
 
     def poll_clipboard(self):
         if self.applying_clipboard or not self.service.clipboard.enabled:
@@ -189,15 +357,19 @@ class Window(QMainWindow):
         sync = self.service.clipboard
         self.applying_clipboard = True
         try:
-            if sync.apply_pending(self.state.peers(), QApplication.clipboard().setText):
+            if sync.apply_pending(self.state.peers(), self.write_clipboard):
                 # OS clipboard may normalize line endings. Baseline the read-back
                 # so the resulting dataChanged/poll never turns into a new update.
-                sync.last_text = self.clipboard_text()
+                self.last_clipboard_image = self.clipboard_image()
+                sync.baseline(self.clipboard_text(), self.last_clipboard_image)
                 self.clipboard_pending = None
                 self.sync_status.setText("已接收远端剪贴板，可以直接粘贴")
-            update = sync.local_change(self.clipboard_text())
-            if update:
-                self.clipboard_pending = (update, sync.generation)
+            text, image = self.clipboard_text(), self.clipboard_image()
+            if text != sync.last_text or image is not self.last_clipboard_image:
+                self.last_clipboard_image = image
+                update = sync.local_change(text, image)
+                if update:
+                    self.clipboard_pending = (update, sync.generation)
         finally:
             self.applying_clipboard = False
         if self.clipboard_job or not self.clipboard_pending:
@@ -207,8 +379,9 @@ class Window(QMainWindow):
         peers = self.state.peers()
         found = self.discovery.snapshot()
         for pid, peer in peers.items():
-            if pid in found:
-                peer.update(host=found[pid]["host"], port=found[pid]["port"])
+            if pid in found and peer.get("fingerprint") == found[pid]["fingerprint"]:
+                online = found[pid]
+                peers[pid] = peer_at(peer, online["host"], online["port"], online["seen"])
         if not peers:
             self.sync_status.setText("剪贴板同步等待配对设备")
             return
@@ -242,15 +415,15 @@ class Window(QMainWindow):
         devices = []
         for pid, peer in known.items():
             peer = dict(peer)
-            online = found.get(pid)
+            online = found.get(pid) if found.get(pid, {}).get("fingerprint") == peer.get("fingerprint") else None
             if online:
                 # Never replace stored fingerprint/token with untrusted UDP values.
-                peer.update(host=online["host"], port=online["port"])
+                peer = peer_at(peer, online["host"], online["port"], online["seen"])
             devices.append((f"{peer['name']} · 已信任{' · 在线' if online else ''}", peer))
         for pid, peer in found.items():
             if pid not in known:
                 devices.append((f"{peer['name']} · 未配对", peer))
-        signature = [(label, p["id"], p["host"], p["port"]) for label, p in devices]
+        signature = [(label, {k: v for k, v in p.items() if k not in ("seen", "lan_seen")}) for label, p in devices]
         if signature != self.last_devices:
             selected = self.devices.currentData()
             self.devices.clear()
@@ -287,7 +460,7 @@ class Window(QMainWindow):
         self.status.setText(f"{'配对成功' if kind == 'paired' else '已收到内容'}：{name}")
         self.refresh()
 
-    def run_job(self, fn, message):
+    def run_job(self, fn, message, *, cancellable=False):
         if self.job:
             return
         self.status.setText(message)
@@ -296,10 +469,18 @@ class Window(QMainWindow):
         for button in (self.pair_btn, self.send_btn, self.file_btn, self.folder_btn, self.forget_btn):
             button.setEnabled(False)
         self.job = Job(fn, self)
+        self.cancel_btn.setVisible(cancellable)
+        self.cancel_btn.setEnabled(cancellable)
         self.job.progress.connect(self.progress.setValue)
         self.job.result.connect(self.job_result)
         self.job.finished.connect(self.job_finished)
         self.job.start()
+
+    def cancel_transfer(self):
+        if self.job:
+            self.job.cancel_event.set()
+            self.cancel_btn.setEnabled(False)
+            self.status.setText("正在取消传输…")
 
     def job_result(self, error):
         if error:
@@ -311,6 +492,7 @@ class Window(QMainWindow):
         self.job.deleteLater()
         self.job = None
         self.progress.hide()
+        self.cancel_btn.hide()
         for button in (self.pair_btn, self.send_btn, self.file_btn, self.folder_btn, self.forget_btn):
             button.setEnabled(True)
         self.refresh()
@@ -320,7 +502,21 @@ class Window(QMainWindow):
         if not peer or "token" not in peer:
             self.status.setText("请先选择已信任的设备，或点击配对。")
             return None
-        return dict(peer)
+        peer = self.state.peers().get(peer["id"])
+        if not peer:
+            return None
+        online = self.discovery.snapshot().get(peer["id"])
+        if online and online["fingerprint"] == peer["fingerprint"]:
+            return peer_at(peer, online["host"], online["port"], online["seen"])
+        return peer
+
+    def send_paths(self, peer, paths):
+        def send(progress):
+            for index, path in enumerate(paths):
+                self.service.send(peer, path=path, cancel=self.job.cancel_event,
+                                  progress=lambda value: progress((index * 100 + value) // len(paths)))
+                progress((index + 1) * 100 // len(paths))
+        self.run_job(send, "正在发送文件或文件夹…", cancellable=True)
 
     def send_text(self):
         peer = self.trusted()
@@ -334,14 +530,14 @@ class Window(QMainWindow):
             return
         path, _ = QFileDialog.getOpenFileName(self, "选择要发送的文件")
         if path:
-            self.run_job(lambda progress: self.service.send(peer, path=path, progress=progress), "正在校验并发送文件…")
+            self.send_paths(peer, [path])
 
     def send_folder(self):
         peer = self.trusted()
         if peer:
             path = QFileDialog.getExistingDirectory(self, "选择要发送的整个文件夹")
             if path:
-                self.run_job(lambda progress: self.service.send(peer, path=path, progress=progress), "正在校验并发送文件夹…")
+                self.send_paths(peer, [path])
 
     def show_invitation(self):
         from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
@@ -361,7 +557,7 @@ class Window(QMainWindow):
         field.setMinimumWidth(560)
         layout.addWidget(field)
         copy = QPushButton("复制配对码")
-        copy.clicked.connect(lambda: QApplication.clipboard().setText(code))
+        copy.clicked.connect(lambda: self.copy_private_text(code))
         layout.addWidget(copy)
         remaining = QLabel()
         layout.addWidget(remaining)
@@ -370,16 +566,48 @@ class Window(QMainWindow):
         timer.start(1000)
         dialog.exec()
 
+    def allow_pairing(self):
+        self.service.allow_pairing()
+        self.status.setText("接收配对已开启两分钟。在另一台设备发起配对，然后核对两边的六位数字。")
+
+    def confirm_pairing(self, name, code):
+        done = threading.Event()
+        accepted = []
+        self.bridge.pairing.emit(name, code, done, accepted)
+        deadline = time.monotonic() + 60
+        while not done.wait(0.2):
+            if self.service.stop_event.is_set() or time.monotonic() >= deadline:
+                done.set()
+                return False
+        return bool(accepted)
+
+    def show_pairing_confirmation(self, name, code, done, accepted):
+        if done.is_set():
+            return
+        self.activate_window()
+        dialog = QMessageBox(QMessageBox.Icon.Question, "核对六位配对码",
+                             f"设备：{name}\n\n{code}\n\n请确认另一台设备显示完全相同的数字。",
+                             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        QTimer.singleShot(59000, dialog.reject)
+        if dialog.exec() == QMessageBox.StandardButton.Yes and not done.is_set():
+            accepted.append(True)
+        done.set()
+        dialog.deleteLater()
+
     def pair_dialog(self):
         dialog = QDialog(self)
         dialog.setWindowTitle("配对 / 手动连接")
         layout = QFormLayout(dialog)
         current = self.devices.currentData() or {}
-        host = QLineEdit(current.get("host", ""))
-        host.setPlaceholderText("另一台电脑的局域网 IPv4，例如 192.168.1.20")
-        port = QLineEdit(str(current.get("port", PORT)))
+        discovered = self.discovery.snapshot().get(current.get("id"))
+        preferred = discovered if discovered and discovered["fingerprint"] == current.get("fingerprint") else current
+        host = QLineEdit(preferred.get("host", ""))
+        host.setPlaceholderText("另一台电脑的局域网或 Tailscale IPv4")
+        port = QLineEdit(str(preferred.get("port", PORT)))
         code = QLineEdit()
-        code.setPlaceholderText("粘贴对方生成的完整配对码；已信任设备可留空以更新 IP")
+        code.setPlaceholderText("可选。留空发起六位码配对，已信任设备留空则更新 IP")
         code.setMinimumWidth(500)
         layout.addRow("对方 IP", host)
         layout.addRow("端口", port)
@@ -400,13 +628,19 @@ class Window(QMainWindow):
             return
         invitation = code.text().strip()
         if not invitation and "token" in current:
-            current.update(host=address, port=number)
-            self.state.trust(current)
+            stored = self.state.peers().get(current["id"])
+            if not stored:
+                return
+            stored.update(host=address, port=number)
+            self.state.trust(peer_at(stored, address, number))
             self.last_devices = None
             self.refresh()
             self.status.setText("已更新地址；发送时仍会核对已信任证书。")
-        else:
+        elif invitation:
             self.run_job(lambda _: self.service.pair(address, number, invitation), "正在安全配对…")
+        else:
+            self.run_job(lambda _: self.service.pair_sas(address, number, self.confirm_pairing),
+                         "正在发起六位码配对…")
 
     def forget(self):
         peer = self.trusted()
@@ -416,15 +650,27 @@ class Window(QMainWindow):
             self.refresh()
             self.status.setText("已取消信任，对方不能再发送内容。重新连接需重新配对。")
 
+    def quit(self):
+        self.quitting = True
+        if self.close():
+            QApplication.quit()
+
     def closeEvent(self, event):
+        if self.tray and not self.quitting:
+            self.hide()
+            event.ignore()
+            return
         if self.job or self.clipboard_job:
-            self.sync_toggle.setChecked(False)
+            self.activate_window()
+            self.quitting = False
             self.status.setText("正在传输，请等待完成后关闭窗口。")
             event.ignore()
             return
         self.timer.stop()
         self.clipboard_timer.stop()
         QApplication.clipboard().dataChanged.disconnect(self.poll_clipboard)
+        if self.tray:
+            self.tray.hide()
         self.discovery.stop()
         self.service.stop()
         event.accept()
