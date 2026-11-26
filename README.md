@@ -178,7 +178,7 @@ python scripts/build.py
 
 Build on the target operating system: Apple Silicon Python for macOS arm64, or x64 Python for Windows. Output goes to `dist/` and includes an application ZIP and SHA-256 checksum file. PyInstaller's `onedir` layout keeps bundled libraries available for troubleshooting and replacement.
 
-GitHub Actions uses `macos-14` (arm64) and `windows-2022` (x64). It checks the Python architecture, runs tests, packages the app, verifies icon resources, and starts the packaged executable for a smoke test, including QR generation and loading the bundled phone page. Test results are saved as JUnit artifacts.
+GitHub Actions uses `macos-15` (arm64) and `windows-2022` (x64). It checks the Python architecture, runs tests, packages the app, verifies icon resources, and starts the packaged executable for a smoke test, including QR generation and loading the bundled phone page. Test results are saved as JUnit artifacts.
 
 - Push to `main` or run the workflow manually to generate downloadable artifacts.
 - Push a `v*` tag to create a **release draft** after both platform builds succeed. The draft includes ZIPs and checksum files; publish it on GitHub after checking the results.
