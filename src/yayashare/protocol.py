@@ -472,9 +472,11 @@ class Service:
         verify_certificate_proof(proof, request["fingerprint"], transcript)
         send_json(conn, {"ok": True})
         conn.settimeout(65)
-        if not self.confirm_pairing(request["name"], sas_code(transcript)):
+        accepted = self.confirm_pairing(request["name"], sas_code(transcript))
+        remote_accepted = read_json(conn).get("confirmed") is True
+        if not accepted:
             raise ValueError("接收设备取消了配对")
-        if read_json(conn).get("confirmed") is not True:
+        if not remote_accepted:
             raise ValueError("发起设备取消了配对")
         token = secrets.token_hex(32)
         self._trust_sas(request, host, request["port"], token)
@@ -498,6 +500,10 @@ class Service:
             confirmed = confirm(remote["name"], sas_code(transcript))
             send_json(conn, {"confirmed": bool(confirmed)})
             if not confirmed:
+                try:
+                    response(conn)
+                except (OSError, ValueError):
+                    pass
                 raise ValueError("已取消配对")
             token = sas_value(response(conn), "token")
             return self._trust_sas(remote, host, port, token)
